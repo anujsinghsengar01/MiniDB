@@ -1,0 +1,18 @@
+package com.minidb.parser;
+
+public enum TokenType {
+    // literals / identifiers
+    IDENTIFIER, INT_LITERAL, DOUBLE_LITERAL, STRING_LITERAL,
+
+    // keywords
+    SELECT, FROM, WHERE, INSERT, INTO, VALUES, UPDATE, SET, DELETE,
+    CREATE, TABLE, DROP, PRIMARY, KEY, NOT, NULL, AND, OR,
+    JOIN, ON, ORDER, BY, ASC, DESC, TRUE, FALSE,
+    INT, VARCHAR, DOUBLE, BOOLEAN,
+
+    // symbols
+    STAR, COMMA, DOT, LPAREN, RPAREN, SEMICOLON,
+    EQ, NEQ, LT, LTE, GT, GTE,
+
+    EOF
+}

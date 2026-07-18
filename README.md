@@ -14,7 +14,7 @@ be added later without touching the core.
 
 Most CRUD apps use a database as a black box. This project builds the box,
 to actually understand: how rows get packed into fixed-size disk pages, how
-a SQL string becomes a query pgit add .lan, how a B+Tree makes lookups fast, and how
+a SQL string becomes a query plan, how a B+Tree makes lookups fast, and how
 a transaction guarantees atomicity even if the process crashes mid-write.
 
 ## Architecture
@@ -107,13 +107,42 @@ detection) work, two tables get fully independent data files, and —
 same persistence bar as the storage engine — **both schemas and their
 row data survive closing and reopening the catalog**.
 
+## SQL Parser (implemented)
+
+Turns SQL text into an AST the executor can walk. Hand-written — no
+ANTLR or parser-generator dependency — so there's no build-time code
+generation to explain away and every grammar rule is visible in the
+source.
+
+- **`Lexer`** — tokenizer. Handles keywords, identifiers, int/double/string
+  literals (with `''`-escaped quotes), operators (`= <> != < <= > >=`),
+  and `--` line comments.
+- **`Parser`** — recursive-descent parser, one method per grammar rule
+  (`parseSelect`, `parseInsert`, `parseWhere`, ...). Supports:
+  - `SELECT` (with column list or `*`, a single `JOIN ... ON`, `WHERE`
+    with `AND`/`OR` and comparisons, `ORDER BY ... ASC|DESC`)
+  - `INSERT INTO ... VALUES` (positional or with an explicit column list)
+  - `UPDATE ... SET ... WHERE`
+  - `DELETE FROM ... WHERE`
+  - `CREATE TABLE` (reuses `catalog.Column` directly — the parser
+    produces exactly the object the Catalog needs, no translation step)
+  - `DROP TABLE`
+- **`ast/`** — the AST node types (`SelectStatement`, `InsertStatement`,
+  `Expression.BinaryExpression`, etc.) that the executor will walk in the
+  next phase.
+
+**Verified:** all six statement types parse correctly, including JOINs,
+ORDER BY with DESC, positional vs. explicit-column INSERT, escaped
+string literals, NOT NULL/PRIMARY KEY constraints, and that malformed
+SQL raises a clear `ParseException` instead of silently misparsing.
+
 ## Roadmap
 
 - [x] **Storage Engine** — page format, disk I/O, buffer pool, heap files
 - [x] **Catalog / Metadata Manager** — table schemas, column types, `CREATE TABLE` / `DROP TABLE`
-- [ ] **SQL Parser** — tokenizer + recursive-descent parser → AST for
-      `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE`, with
-      `WHERE`, `JOIN`, `ORDER BY`
+- [x] **SQL Parser** — tokenizer + recursive-descent parser → AST for
+      `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE`,
+      with `WHERE`, `JOIN`, `ORDER BY`
 - [ ] **Query Executor** — table scans, filters, projections, nested-loop joins
 - [ ] **Index Manager** — B+Tree indexes, `CREATE INDEX`
 - [ ] **Transaction Manager** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-ahead log, locking
@@ -148,3 +177,7 @@ mvn package         # build runnable jar
   the catalog doesn't invent a second persistence mechanism; it reuses
   `HeapFile` to store schema rows. One storage engine to test and trust,
   not two.
+- **Hand-written parser over a parser generator** — recursive descent
+  means the grammar and the code implementing it live side by side; it's
+  slower to write than pointing ANTLR at a `.g4` file, but there's nothing
+  generated or opaque to explain in an interview.
