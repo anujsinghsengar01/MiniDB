@@ -14,7 +14,7 @@ be added later without touching the core.
 
 Most CRUD apps use a database as a black box. This project builds the box,
 to actually understand: how rows get packed into fixed-size disk pages, how
-a SQL string becomes a query plan, how a B+Tree makes lookups fast, and how
+a SQL string becomes a query pgit add .lan, how a B+Tree makes lookups fast, and how
 a transaction guarantees atomicity even if the process crashes mid-write.
 
 ## Architecture
@@ -82,10 +82,35 @@ correctly skips deleted (tombstoned) records, and — critically — data
 **survives closing and reopening the file**, proving it's genuinely
 persisted to disk and not just held in memory.
 
+## Catalog / metadata manager (implemented)
+
+Tracks what tables exist and what they look like.
+
+- **`ColumnType`** — the supported column types: `INT`, `DOUBLE`, `VARCHAR`, `BOOLEAN`.
+- **`Column`** — one column's name, type, VARCHAR length, and constraints
+  (`PRIMARY KEY`, nullability). Immutable by design.
+- **`TableSchema`** — a table's name + ordered column list, with binary
+  `serialize()`/`deserialize()` so it can be stored as plain bytes.
+- **`Catalog`** — the piece that ties it together:
+  - Persists every table's schema as a row in its own system table
+    (`catalog.sys`), using the *same* `HeapFile` storage engine that
+    stores regular data — MiniDB's metadata is just rows in a table,
+    exactly like Postgres's `pg_catalog`.
+  - Gives each table its own on-disk data file (`<table>.tbl`) and its
+    own `HeapFile`, opened lazily and cached.
+  - Handles `CREATE TABLE` / `DROP TABLE`, table/column lookups, and
+    closing/flushing everything cleanly.
+
+**Verified:** schema round-trips through serialization, duplicate
+`CREATE TABLE` is rejected, column lookups (including primary key
+detection) work, two tables get fully independent data files, and —
+same persistence bar as the storage engine — **both schemas and their
+row data survive closing and reopening the catalog**.
+
 ## Roadmap
 
 - [x] **Storage Engine** — page format, disk I/O, buffer pool, heap files
-- [ ] **Catalog / Metadata Manager** — table schemas, column types, `CREATE TABLE`
+- [x] **Catalog / Metadata Manager** — table schemas, column types, `CREATE TABLE` / `DROP TABLE`
 - [ ] **SQL Parser** — tokenizer + recursive-descent parser → AST for
       `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE`, with
       `WHERE`, `JOIN`, `ORDER BY`
@@ -119,3 +144,7 @@ mvn package         # build runnable jar
 - **Engine/interface split from day one** — the interface layer only ever
   sees "SQL string in, result out," so adding a TCP listener later is an
   additive change, not a rewrite.
+- **Metadata stored using the engine's own storage, not a side format** —
+  the catalog doesn't invent a second persistence mechanism; it reuses
+  `HeapFile` to store schema rows. One storage engine to test and trust,
+  not two.
