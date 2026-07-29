@@ -136,6 +136,35 @@ ORDER BY with DESC, positional vs. explicit-column INSERT, escaped
 string literals, NOT NULL/PRIMARY KEY constraints, and that malformed
 SQL raises a clear `ParseException` instead of silently misparsing.
 
+## Query Executor (implemented)
+
+Where SQL actually starts doing something — walks the AST and runs it
+against the Catalog and HeapFiles.
+
+- **`RowSerializer`** — converts a typed row (`Object[]`) to and from the
+  `byte[]` a `HeapFile` stores, and coerces parsed literals into a
+  column's exact type (an `INT` literal into a `DOUBLE` column becomes a
+  `Double`), enforcing `NOT NULL`/`VARCHAR` length along the way.
+- **`RowContext`** + **`ExpressionEvaluator`** — resolve column references
+  (qualified or not) and evaluate `WHERE`/`JOIN...ON` expressions against
+  a row, or a pair of rows when a join is involved.
+- **`Executor`** — one method per statement type:
+  - `CREATE TABLE` / `DROP TABLE` → straight to the Catalog
+  - `INSERT` → coerces + validates values, checks `PRIMARY KEY`
+    uniqueness (currently a full scan — the Index phase will make this
+    O(log n)), serializes, writes
+  - `SELECT` → scan → optional nested-loop `JOIN` → filter (`WHERE`) →
+    sort (`ORDER BY`) → project (column list or `*`)
+  - `UPDATE` / `DELETE` → matches are materialized before mutating, so
+    the executor never mutates a `HeapFile` while scanning it
+
+**Verified:** the full pipeline end-to-end — SQL text → parse → execute
+→ real bytes on disk — across `CREATE TABLE`, positional and named
+`INSERT`, duplicate-`PRIMARY KEY` rejection, `NOT NULL` rejection,
+`WHERE` filtering (including `AND`), `ORDER BY DESC`, `UPDATE`,
+`DELETE`, a `JOIN` combined with `WHERE`, and data + schema surviving a
+full restart.
+
 ## Roadmap
 
 - [x] **Storage Engine** — page format, disk I/O, buffer pool, heap files
@@ -143,7 +172,7 @@ SQL raises a clear `ParseException` instead of silently misparsing.
 - [x] **SQL Parser** — tokenizer + recursive-descent parser → AST for
       `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE`,
       with `WHERE`, `JOIN`, `ORDER BY`
-- [ ] **Query Executor** — table scans, filters, projections, nested-loop joins
+- [x] **Query Executor** — table scans, filters, projections, nested-loop joins
 - [ ] **Index Manager** — B+Tree indexes, `CREATE INDEX`
 - [ ] **Transaction Manager** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-ahead log, locking
 - [ ] **Interface Layer** — Java API + CLI shell (network/TCP mode is a
@@ -181,3 +210,8 @@ mvn package         # build runnable jar
   means the grammar and the code implementing it live side by side; it's
   slower to write than pointing ANTLR at a `.g4` file, but there's nothing
   generated or opaque to explain in an interview.
+- **Materialize before mutate** — `UPDATE`/`DELETE` first collect every
+  matching row's RID into a list, *then* mutate. Deleting/updating while
+  a `HeapFile` scan iterator is still walking the same pages is a classic
+  source of skipped or double-processed rows; separating "find" from
+  "act" avoids it entirely.
