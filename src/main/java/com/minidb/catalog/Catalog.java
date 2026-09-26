@@ -137,6 +137,11 @@ public class Catalog implements AutoCloseable {
         return names;
     }
 
+    /** The directory this catalog and all its tables' data files live in — used to place the WAL alongside them. */
+    public String getDataDirectoryPath() {
+        return dataDirectory.getPath();
+    }
+
     /** Returns the HeapFile backing a table's row data, opening its data file on first access. */
     public synchronized HeapFile getHeapFile(String tableName) throws IOException {
         String key = key(tableName);

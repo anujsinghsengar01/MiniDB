@@ -165,16 +165,114 @@ against the Catalog and HeapFiles.
 `DELETE`, a `JOIN` combined with `WHERE`, and data + schema surviving a
 full restart.
 
+## Index Manager (implemented)
+
+A real B+Tree — not a `TreeMap` dressed up as one — wired into the
+executor so lookups on indexed columns skip the full table scan.
+
+- **`BPlusTree<K>`** — proper node-splitting B+Tree: internal nodes hold
+  only routing keys, leaf nodes hold the actual key → `RecordId` entries
+  and are linked (`leaf.next`) for fast ordered range scans. Supports
+  `insert` (with cascading splits up to a new root when needed),
+  `search`, `rangeSearch`, and `delete`. Duplicate keys are supported —
+  each key maps to a *list* of RIDs, so indexing a non-unique column
+  still works.
+- **`IndexManager`** — owns every index (`table.column` → tree),
+  handles `CREATE INDEX` (backfills the tree from a full table scan),
+  and keeps every index current as the executor runs `INSERT`/`UPDATE`/
+  `DELETE` — `HeapFile` itself stays completely unaware indexes exist.
+- **Executor integration** — two fast paths:
+  - `PRIMARY KEY` uniqueness checks use the index (O(log n)) instead of
+    a full scan, when one exists on the PK column.
+  - A `SELECT ... WHERE col = value` on an indexed column skips the
+    table scan entirely and goes straight to the B+Tree — the WHERE
+    clause is still re-evaluated afterward, so this is purely a
+    performance path, never a correctness shortcut.
+
+**Verified:** a 200-key shuffled-insert stress test (forces many node
+splits) — every key found via `search()`, range scans return exactly
+the requested bounds, duplicate keys accumulate correctly, deletes
+don't disturb sibling keys. On the integration side: `CREATE INDEX`
+correctly backfills from existing rows, a row inserted *after* the
+index exists is still found through it, `PRIMARY KEY` violations are
+still caught via the fast path, and the index stays correct through
+`UPDATE` (old key gone, new key resolves) and `DELETE`.
+
+**Known trade-off (documented, not accidental):** the tree lives in
+memory and is rebuilt from a table scan whenever `CREATE INDEX` runs —
+it isn't yet persisted to its own disk pages across a restart, and
+deletion doesn't rebalance/merge underfull nodes. Both are natural
+next steps, and both would reuse the exact same `Page`/`PageManager`
+this project already has — just with a B+Tree node layout instead of a
+heap layout.
+
+## Transaction Manager (implemented)
+
+`BEGIN` / `COMMIT` / `ROLLBACK`, a real write-ahead log, and table-level
+locking — while keeping every previous layer's behavior unchanged when
+no transaction is explicitly started.
+
+- **`WriteAheadLog`** — an append-only, `fsync`'d log of every mutation
+  (plain pipe-delimited text, deliberately human-readable over binary —
+  easy to open and point at while explaining how it works). Every write
+  calls `getFD().sync()` before returning: the WAL's whole reason to
+  exist is that the log record is durable *before* you rely on it.
+- **`TransactionManager`** — two modes, exactly like a real database
+  connection:
+  - **Auto-commit** (the default, no `BEGIN` issued): every statement is
+    wrapped in its own implicit transaction — logged, applied, committed
+    — so every earlier phase's behavior is completely unchanged.
+  - **Explicit transaction**: `BEGIN` starts one; every mutation records
+    an in-memory undo entry; `ROLLBACK` replays them in reverse; `COMMIT`
+    just releases locks and clears the log.
+- **`LockManager`** — table-level exclusive locking (two-phase locking:
+  every lock a transaction takes is held until commit/rollback, none
+  released early). Only one transaction can be active at a time in this
+  version, so there's no real contention *yet* — but the
+  acquire/release protocol is exactly what a concurrent scheduler would
+  call unchanged, so it's a real extension point, not a decoration.
+- **Executor integration** — the Executor still performs every mutation
+  itself (heap write + index update); `TransactionManager` only logs
+  what happened and remembers how to reverse it. `UNDO` for an `INSERT`
+  is a `DELETE`; for a `DELETE` it's a re-`INSERT` (landing at a new
+  physical RID, which is fine — rollback happens within the same live
+  session); for an `UPDATE` it's delete-the-new + reinsert-the-old.
+
+**Verified:** auto-commit mode is provably unaffected (every earlier
+phase's tests still pass unchanged); `ROLLBACK` correctly undoes a
+single `INSERT`/`UPDATE`/`DELETE` and a multi-statement transaction
+mixing all three; nested `BEGIN` and a stray `COMMIT`/`ROLLBACK` with
+no active transaction are both rejected; the WAL file is created on
+disk and contains real `BEGIN`/`COMMIT`/`ROLLBACK` entries.
+
+**A real bug this test suite actually caught:** the first version of
+`UPDATE` rollback deleted the post-update row and reinserted the old
+one, but forgot to remove the *stale* index entry for the post-update
+row first — leaving two index entries for the same key and causing a
+false "duplicate primary key" on the next insert. The fix reads the
+row's current values before deleting it, so the correct index entry
+gets removed regardless of which column changed. Kept as a named
+regression test (`rollbackKeepsIndexConsistentAfterUpdate`) rather than
+quietly fixed, because "index maintenance must reflect current
+on-disk state, not a stale snapshot" is exactly the kind of subtle
+correctness rule worth being able to explain in an interview.
+
+**Known trade-off:** this WAL is not yet replayed on startup to REDO
+committed-but-unflushed work after an actual process crash — only
+explicit, in-session `ROLLBACK` is implemented. Crash recovery would
+scan this exact log file; it's the natural next step, not a different
+mechanism.
+
 ## Roadmap
 
 - [x] **Storage Engine** — page format, disk I/O, buffer pool, heap files
 - [x] **Catalog / Metadata Manager** — table schemas, column types, `CREATE TABLE` / `DROP TABLE`
 - [x] **SQL Parser** — tokenizer + recursive-descent parser → AST for
-      `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE`,
+      `SELECT` / `INSERT` / `UPDATE` / `DELETE` / `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `BEGIN` / `COMMIT` / `ROLLBACK`,
       with `WHERE`, `JOIN`, `ORDER BY`
 - [x] **Query Executor** — table scans, filters, projections, nested-loop joins
-- [ ] **Index Manager** — B+Tree indexes, `CREATE INDEX`
-- [ ] **Transaction Manager** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-ahead log, locking
+- [x] **Index Manager** — B+Tree indexes, `CREATE INDEX`, index-accelerated `WHERE` and `PRIMARY KEY` checks
+- [x] **Transaction Manager** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-ahead log, table-level locking
 - [ ] **Interface Layer** — Java API + CLI shell (network/TCP mode is a
       future extension point, not part of the initial build)
 
@@ -215,3 +313,22 @@ mvn package         # build runnable jar
   a `HeapFile` scan iterator is still walking the same pages is a classic
   source of skipped or double-processed rows; separating "find" from
   "act" avoids it entirely.
+- **A real B+Tree, deliberately not `TreeMap`** — implementing the actual
+  node-splitting insert algorithm (and its trade-offs, like why deletion
+  skips rebalancing) is the whole point of the exercise; wrapping a
+  built-in sorted map would answer the interview question "how does a
+  database index work?" with "it doesn't, I used a library."
+- **Index maintenance lives in the Executor, not the storage layer** —
+  `HeapFile` never learns an index exists. The Executor calls
+  `IndexManager.onInsert`/`onDelete` after every mutation, keeping the
+  storage engine's one job (move bytes) separate from the indexing
+  layer's job (keep a fast lookup structure in sync).
+- **Auto-commit as the default, not a special case** — every statement
+  outside an explicit `BEGIN` is its own implicit transaction (logged,
+  applied, committed), so adding transaction support didn't change a
+  single line of behavior for code that never uses `BEGIN` — which is
+  most of the test suite from earlier phases.
+- **Text WAL over binary** — a real database wouldn't do this for
+  performance, but being able to `cat wal.log` mid-demo and point at the
+  exact line that recorded an operation is worth more here than the
+  throughput a binary format would buy.

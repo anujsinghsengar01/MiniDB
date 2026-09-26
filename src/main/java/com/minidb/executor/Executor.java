@@ -4,9 +4,11 @@ import com.minidb.catalog.Catalog;
 import com.minidb.catalog.CatalogException;
 import com.minidb.catalog.Column;
 import com.minidb.catalog.TableSchema;
+import com.minidb.index.IndexManager;
 import com.minidb.parser.ast.*;
 import com.minidb.storage.HeapFile;
 import com.minidb.storage.RecordId;
+import com.minidb.transaction.TransactionManager;
 
 import java.io.IOException;
 import java.util.*;
@@ -20,20 +22,38 @@ import java.util.*;
  * One public entry point, execute(), dispatches to a private method per
  * statement type. SELECT is by far the most involved: scan -> filter
  * (WHERE) -> sort (ORDER BY) -> project (column list), with an optional
- * nested-loop JOIN folded into the scan/filter stage.
+ * nested-loop JOIN folded into the scan/filter stage. When an equality
+ * WHERE targets an indexed column, the scan is replaced with a B+Tree
+ * point lookup via IndexManager instead of reading every page. Every
+ * mutation is wrapped by TransactionManager, which logs it to the WAL and
+ * (inside an explicit BEGIN) records how to undo it on ROLLBACK.
  */
 public class Executor {
 
     private final Catalog catalog;
+    private final IndexManager indexManager;
+    private final TransactionManager transactionManager;
 
-    public Executor(Catalog catalog) {
+    public Executor(Catalog catalog) throws IOException {
+        this(catalog, new IndexManager());
+    }
+
+    public Executor(Catalog catalog, IndexManager indexManager) throws IOException {
+        this(catalog, indexManager, new TransactionManager(catalog.getDataDirectoryPath()));
+    }
+
+    public Executor(Catalog catalog, IndexManager indexManager, TransactionManager transactionManager) {
         this.catalog = catalog;
+        this.indexManager = indexManager;
+        this.transactionManager = transactionManager;
     }
 
     public ExecutionResult execute(Statement statement) throws IOException {
         try {
             if (statement instanceof CreateTableStatement) return executeCreateTable((CreateTableStatement) statement);
             if (statement instanceof DropTableStatement) return executeDropTable((DropTableStatement) statement);
+            if (statement instanceof CreateIndexStatement) return executeCreateIndex((CreateIndexStatement) statement);
+            if (statement instanceof TransactionControlStatement) return executeTransactionControl((TransactionControlStatement) statement);
             if (statement instanceof InsertStatement) return executeInsert((InsertStatement) statement);
             if (statement instanceof SelectStatement) return executeSelect((SelectStatement) statement);
             if (statement instanceof UpdateStatement) return executeUpdate((UpdateStatement) statement);
@@ -57,10 +77,40 @@ public class Executor {
         return ExecutionResult.update(0, "Table '" + stmt.tableName + "' dropped");
     }
 
+    // ---------- CREATE INDEX ----------
+
+    private ExecutionResult executeCreateIndex(CreateIndexStatement stmt) throws IOException {
+        TableSchema schema = catalog.getSchema(stmt.tableName);
+        HeapFile heapFile = catalog.getHeapFile(stmt.tableName);
+        indexManager.createIndex(stmt.indexName, stmt.tableName, stmt.columnName, schema, heapFile);
+        return ExecutionResult.update(0, "Index '" + stmt.indexName + "' created on "
+                + stmt.tableName + "(" + stmt.columnName + ")");
+    }
+
+    // ---------- BEGIN / COMMIT / ROLLBACK ----------
+
+    private ExecutionResult executeTransactionControl(TransactionControlStatement stmt) throws IOException {
+        switch (stmt.kind) {
+            case BEGIN: {
+                int id = transactionManager.begin();
+                return ExecutionResult.update(0, "Transaction " + id + " started");
+            }
+            case COMMIT:
+                transactionManager.commit();
+                return ExecutionResult.update(0, "Transaction committed");
+            case ROLLBACK:
+                transactionManager.rollback(catalog, indexManager);
+                return ExecutionResult.update(0, "Transaction rolled back");
+            default:
+                throw new ExecutionException("Unknown transaction control statement: " + stmt.kind);
+        }
+    }
+
     // ---------- INSERT ----------
 
     private ExecutionResult executeInsert(InsertStatement stmt) throws IOException {
         TableSchema schema = catalog.getSchema(stmt.tableName);
+        transactionManager.lockTable(stmt.tableName);
         List<Column> schemaColumns = schema.getColumns();
         Object[] rowValues = new Object[schemaColumns.size()];
 
@@ -94,7 +144,9 @@ public class Executor {
         checkPrimaryKeyUnique(schema, heapFile, rowValues, null);
 
         byte[] encoded = RowSerializer.encode(rowValues, schema);
-        heapFile.insert(encoded);
+        RecordId rid = heapFile.insert(encoded);
+        indexManager.onInsert(stmt.tableName, schema, rowValues, rid);
+        transactionManager.afterInsert(stmt.tableName, rowValues, rid);
 
         return ExecutionResult.update(1, "1 row inserted");
     }
@@ -102,14 +154,25 @@ public class Executor {
     private void checkPrimaryKeyUnique(TableSchema schema, HeapFile heapFile, Object[] newValues, RecordId excludeRid) throws IOException {
         Optional<Column> pk = schema.getPrimaryKeyColumn();
         if (!pk.isPresent()) return;
-        int pkIndex = schema.getColumnIndex(pk.get().getName());
+        String pkColumn = pk.get().getName();
+        int pkIndex = schema.getColumnIndex(pkColumn);
         Object pkValue = newValues[pkIndex];
+
+        // Fast path: an index on the PK column turns this into an O(log n) lookup instead of a full scan.
+        if (indexManager.hasIndex(schema.getTableName(), pkColumn)) {
+            for (RecordId rid : indexManager.lookup(schema.getTableName(), pkColumn, pkValue)) {
+                if (excludeRid == null || !rid.equals(excludeRid)) {
+                    throw new ExecutionException("Duplicate value '" + pkValue + "' for PRIMARY KEY column '" + pkColumn + "'");
+                }
+            }
+            return;
+        }
 
         for (HeapFile.RecordEntry entry : heapFile.scanAll()) {
             if (excludeRid != null && entry.rid.equals(excludeRid)) continue;
             Object[] existing = RowSerializer.decode(entry.data, schema);
             if (Objects.equals(existing[pkIndex], pkValue)) {
-                throw new ExecutionException("Duplicate value '" + pkValue + "' for PRIMARY KEY column '" + pk.get().getName() + "'");
+                throw new ExecutionException("Duplicate value '" + pkValue + "' for PRIMARY KEY column '" + pkColumn + "'");
             }
         }
     }
@@ -133,7 +196,11 @@ public class Executor {
         List<Object[]> candidateRows = new ArrayList<>();
 
         if (stmt.join == null) {
-            for (HeapFile.RecordEntry entry : mainHeap.scanAll()) {
+            List<HeapFile.RecordEntry> entries = tryIndexScan(stmt, mainSchema, mainHeap);
+            if (entries == null) {
+                entries = mainHeap.scanAll();
+            }
+            for (HeapFile.RecordEntry entry : entries) {
                 Object[] values = RowSerializer.decode(entry.data, mainSchema);
                 RowContext ctx = new RowContext();
                 ctx.addTable(stmt.fromTable, mainSchema, values);
@@ -212,6 +279,48 @@ public class Executor {
         return ExecutionResult.query(new ResultSet(outputNames, outputRows));
     }
 
+    /**
+     * If the WHERE clause is a single equality on an indexed column of the
+     * FROM table (no JOIN involved), fetch matching rows via the B+Tree
+     * instead of a full scan. Returns null when no such shortcut applies —
+     * the caller falls back to a normal scan. The WHERE clause is still
+     * re-evaluated afterward either way, so this is purely a performance
+     * path, never a correctness shortcut.
+     */
+    private List<HeapFile.RecordEntry> tryIndexScan(SelectStatement stmt, TableSchema mainSchema, HeapFile mainHeap) throws IOException {
+        if (!(stmt.whereClause instanceof Expression.BinaryExpression)) return null;
+        Expression.BinaryExpression eq = (Expression.BinaryExpression) stmt.whereClause;
+        if (eq.operator != Expression.Operator.EQ) return null;
+
+        Expression.ColumnReference colRef;
+        Expression.Literal literal;
+        if (eq.left instanceof Expression.ColumnReference && eq.right instanceof Expression.Literal) {
+            colRef = (Expression.ColumnReference) eq.left;
+            literal = (Expression.Literal) eq.right;
+        } else if (eq.right instanceof Expression.ColumnReference && eq.left instanceof Expression.Literal) {
+            colRef = (Expression.ColumnReference) eq.right;
+            literal = (Expression.Literal) eq.left;
+        } else {
+            return null;
+        }
+
+        if (colRef.tableQualifier != null && !colRef.tableQualifier.equalsIgnoreCase(stmt.fromTable)) return null;
+        if (!indexManager.hasIndex(stmt.fromTable, colRef.columnName)) return null;
+
+        Column column = mainSchema.getColumn(colRef.columnName);
+        Object key = RowSerializer.coerce(literal.value, column);
+        if (key == null) return null; // an index has no entries for NULL values
+
+        List<HeapFile.RecordEntry> results = new ArrayList<>();
+        for (RecordId rid : indexManager.lookup(stmt.fromTable, colRef.columnName, key)) {
+            byte[] data = mainHeap.read(rid);
+            if (data != null) {
+                results.add(new HeapFile.RecordEntry(rid, data));
+            }
+        }
+        return results;
+    }
+
     private int resolveColumnIndex(List<ColumnInfo> combinedColumns, String qualifier, String columnName) {
         int found = -1;
         for (int i = 0; i < combinedColumns.size(); i++) {
@@ -246,6 +355,7 @@ public class Executor {
     private ExecutionResult executeUpdate(UpdateStatement stmt) throws IOException {
         TableSchema schema = catalog.getSchema(stmt.tableName);
         HeapFile heapFile = catalog.getHeapFile(stmt.tableName);
+        transactionManager.lockTable(stmt.tableName);
 
         // Materialize matches first so we're not mutating the heap file while scanning it.
         List<HeapFile.RecordEntry> matches = new ArrayList<>();
@@ -260,7 +370,8 @@ public class Executor {
 
         int updated = 0;
         for (HeapFile.RecordEntry entry : matches) {
-            Object[] newValues = RowSerializer.decode(entry.data, schema);
+            Object[] oldValues = RowSerializer.decode(entry.data, schema);
+            Object[] newValues = oldValues.clone();
             for (UpdateStatement.SetClause set : stmt.assignments) {
                 int idx = schema.getColumnIndex(set.columnName);
                 if (idx == -1) {
@@ -269,7 +380,11 @@ public class Executor {
                 newValues[idx] = RowSerializer.coerce(set.value.value, schema.getColumns().get(idx));
             }
             checkPrimaryKeyUnique(schema, heapFile, newValues, entry.rid);
-            heapFile.update(entry.rid, RowSerializer.encode(newValues, schema));
+
+            RecordId newRid = heapFile.update(entry.rid, RowSerializer.encode(newValues, schema));
+            indexManager.onDelete(stmt.tableName, schema, oldValues, entry.rid);
+            indexManager.onInsert(stmt.tableName, schema, newValues, newRid);
+            transactionManager.afterUpdate(stmt.tableName, oldValues, entry.rid, newRid);
             updated++;
         }
 
@@ -281,19 +396,23 @@ public class Executor {
     private ExecutionResult executeDelete(DeleteStatement stmt) throws IOException {
         TableSchema schema = catalog.getSchema(stmt.tableName);
         HeapFile heapFile = catalog.getHeapFile(stmt.tableName);
+        transactionManager.lockTable(stmt.tableName);
 
-        List<RecordId> toDelete = new ArrayList<>();
+        List<HeapFile.RecordEntry> toDelete = new ArrayList<>();
         for (HeapFile.RecordEntry entry : heapFile.scanAll()) {
             Object[] values = RowSerializer.decode(entry.data, schema);
             RowContext ctx = new RowContext();
             ctx.addTable(stmt.tableName, schema, values);
             if (stmt.whereClause == null || ExpressionEvaluator.evaluateBoolean(stmt.whereClause, ctx)) {
-                toDelete.add(entry.rid);
+                toDelete.add(entry);
             }
         }
 
-        for (RecordId rid : toDelete) {
-            heapFile.delete(rid);
+        for (HeapFile.RecordEntry entry : toDelete) {
+            Object[] values = RowSerializer.decode(entry.data, schema);
+            heapFile.delete(entry.rid);
+            indexManager.onDelete(stmt.tableName, schema, values, entry.rid);
+            transactionManager.afterDelete(stmt.tableName, values, entry.rid);
         }
 
         return ExecutionResult.update(toDelete.size(), toDelete.size() + " row(s) deleted");

@@ -70,8 +70,15 @@ public class Parser {
             case INSERT: stmt = parseInsert(); break;
             case UPDATE: stmt = parseUpdate(); break;
             case DELETE: stmt = parseDelete(); break;
-            case CREATE: stmt = parseCreateTable(); break;
+            case CREATE:
+                stmt = (peekNext().type == TokenType.INDEX) ? parseCreateIndex() : parseCreateTable();
+                break;
             case DROP:   stmt = parseDropTable(); break;
+            case BEGIN:
+            case COMMIT:
+            case ROLLBACK:
+                stmt = parseTransactionControl();
+                break;
             default:
                 throw error("Expected a statement (SELECT/INSERT/UPDATE/DELETE/CREATE TABLE/DROP TABLE)", t);
         }
@@ -275,6 +282,32 @@ public class Parser {
         return new DropTableStatement(table);
     }
 
+    private CreateIndexStatement parseCreateIndex() {
+        expect(TokenType.CREATE);
+        expect(TokenType.INDEX);
+        String indexName = expect(TokenType.IDENTIFIER, "index name").text;
+        expect(TokenType.ON);
+        String table = expect(TokenType.IDENTIFIER, "table name").text;
+        expect(TokenType.LPAREN);
+        String column = expect(TokenType.IDENTIFIER, "column name").text;
+        expect(TokenType.RPAREN);
+        return new CreateIndexStatement(indexName, table, column);
+    }
+
+    private TransactionControlStatement parseTransactionControl() {
+        Token t = advance();
+        TransactionControlStatement.Kind kind;
+        switch (t.type) {
+            case BEGIN: kind = TransactionControlStatement.Kind.BEGIN; break;
+            case COMMIT: kind = TransactionControlStatement.Kind.COMMIT; break;
+            case ROLLBACK: kind = TransactionControlStatement.Kind.ROLLBACK; break;
+            default:
+                throw error("Expected BEGIN, COMMIT, or ROLLBACK", t);
+        }
+        match(TokenType.TRANSACTION); // optional trailing keyword, e.g. "COMMIT TRANSACTION"
+        return new TransactionControlStatement(kind);
+    }
+
     // ---------- expressions (used in WHERE and JOIN...ON) ----------
 
     private Expression parseExpression() {
@@ -351,6 +384,10 @@ public class Parser {
 
     private Token peek() {
         return tokens.get(pos);
+    }
+
+    private Token peekNext() {
+        return tokens.get(Math.min(pos + 1, tokens.size() - 1));
     }
 
     private boolean check(TokenType type) {
