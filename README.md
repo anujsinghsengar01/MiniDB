@@ -273,17 +273,69 @@ mechanism.
 - [x] **Query Executor** — table scans, filters, projections, nested-loop joins
 - [x] **Index Manager** — B+Tree indexes, `CREATE INDEX`, index-accelerated `WHERE` and `PRIMARY KEY` checks
 - [x] **Transaction Manager** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-ahead log, table-level locking
-- [ ] **Interface Layer** — Java API + CLI shell (network/TCP mode is a
-      future extension point, not part of the initial build)
+- [x] **Interface Layer** — `MiniDBConnection` Java API + `MiniDBShell` CLI
+      (network/TCP mode is a future extension point — see the "Engine/interface
+      split" talking point below for why it's a thin addition, not a rewrite)
+
+## Interface Layer (implemented)
+
+The last piece — a way to actually use everything above.
+
+- **`MiniDBConnection`** — the public, embeddable Java API. Open a
+  connection to a data directory, call `execute(sql)`, get a typed
+  `ExecutionResult` back. This is the *only* class an external caller
+  needs to know about — the parser, catalog, executor, index manager,
+  and transaction manager are all wired together inside it and stay an
+  implementation detail. A future TCP server would sit behind this exact
+  same method, not a different code path.
+- **`MiniDBShell`** — an interactive REPL. Reads SQL statements
+  terminated by `;` (supports multi-line input), prints `SELECT` results
+  as a formatted table, prints a status + timing for everything else,
+  and has a few shell conveniences (`tables`, `help`, `exit`).
+
+**Verified:** ran it for real — piped a sequence of `CREATE TABLE` /
+`INSERT` / `SELECT ... WHERE ... ORDER BY` / `tables` / `help` through
+the actual shell binary and confirmed the formatted table output,
+timings, and messages all come back correctly.
 
 ## Building and running
 
-Requires Java 17+ and Maven.
+Requires Java 17+. Maven is used for dependency management and tests
+(JUnit); the project also compiles with plain `javac` if you don't have
+Maven set up, since it has no external runtime dependencies.
+
+**With Maven:**
 
 ```bash
-mvn compile        # compile
-mvn test           # run unit tests
-mvn package         # build runnable jar
+mvn compile              # compile
+mvn test                 # run the JUnit test suite
+mvn package               # build target/minidb-0.1.0-SNAPSHOT.jar
+java -jar target/minidb-0.1.0-SNAPSHOT.jar [data-directory]
+```
+
+**Without Maven (plain javac/java):**
+
+```bash
+mkdir out
+javac -d out $(find src/main/java -name "*.java")
+java -cp out com.minidb.cli.MiniDBShell [data-directory]
+```
+
+`data-directory` is where MiniDB stores its table files, the system
+catalog, and the WAL — it defaults to `minidb_data` in the current
+directory if you don't pass one. Then just type SQL:
+
+```
+minidb> CREATE TABLE students (id INT PRIMARY KEY, name VARCHAR(50), gpa DOUBLE);
+Table 'students' created (4 ms)
+minidb> INSERT INTO students VALUES (1, 'Anuj', 3.9);
+1 row inserted (2 ms)
+minidb> SELECT * FROM students WHERE gpa > 3.5;
+| id | name | gpa |
++----+------+-----+
+| 1  | Anuj | 3.9 |
+(1 row(s) in 1 ms)
+minidb> exit
 ```
 
 ## Design decisions worth calling out (interview talking points)
