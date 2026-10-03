@@ -290,13 +290,34 @@ The last piece — a way to actually use everything above.
   same method, not a different code path.
 - **`MiniDBShell`** — an interactive REPL. Reads SQL statements
   terminated by `;` (supports multi-line input), prints `SELECT` results
-  as a formatted table, prints a status + timing for everything else,
-  and has a few shell conveniences (`tables`, `help`, `exit`).
+  as a Unicode box-drawn table, prints a colored status + timing for
+  everything else, and has a few shell conveniences (`tables`, `help`,
+  `exit`). ANSI colors auto-disable when output isn't an interactive
+  terminal (piped output, redirected to a file) or when `NO_COLOR` is
+  set, so logs and test harnesses never see raw escape codes.
+
+**A real portability bug this caught:** the first version silently
+printed `?` in place of every box-drawing character, because a JVM
+started with no OS locale set falls back to ASCII for `System.out` —
+it wasn't a rendering issue, the bytes written really were `?`
+(confirmed by inspecting them directly). Fixed by explicitly wrapping
+`System.out` in a UTF-8 `PrintStream` instead of trusting the
+platform default. There's also a plain-ASCII fallback
+(`MINIDB_ASCII=1`) for any terminal that genuinely can't render
+Unicode at all, so the shell degrades gracefully instead of breaking.
 
 **Verified:** ran it for real — piped a sequence of `CREATE TABLE` /
 `INSERT` / `SELECT ... WHERE ... ORDER BY` / `tables` / `help` through
 the actual shell binary and confirmed the formatted table output,
-timings, and messages all come back correctly.
+timings, and messages all come back correctly; inspected the raw
+output bytes to confirm proper UTF-8 after the fix; confirmed the
+`MINIDB_ASCII=1` fallback renders cleanly with no Unicode at all.
+
+> **Windows note:** if the banner/table show as `?` or garbled
+> characters in classic Command Prompt, run `chcp 65001` once before
+> launching MiniDB to switch the console to UTF-8 — Windows Terminal
+> and PowerShell 7 handle this automatically. Or just set
+> `MINIDB_ASCII=1` and skip the question entirely.
 
 ## Building and running
 
@@ -327,15 +348,84 @@ directory if you don't pass one. Then just type SQL:
 
 ```
 minidb> CREATE TABLE students (id INT PRIMARY KEY, name VARCHAR(50), gpa DOUBLE);
-Table 'students' created (4 ms)
+✓ Table 'students' created (4 ms)
 minidb> INSERT INTO students VALUES (1, 'Anuj', 3.9);
-1 row inserted (2 ms)
+✓ 1 row inserted (2 ms)
 minidb> SELECT * FROM students WHERE gpa > 3.5;
-| id | name | gpa |
-+----+------+-----+
-| 1  | Anuj | 3.9 |
+┌────┬──────┬─────┐
+│ id │ name │ gpa │
+├────┼──────┼─────┤
+│ 1  │ Anuj │ 3.9 │
+└────┴──────┴─────┘
 (1 row(s) in 1 ms)
 minidb> exit
+```
+
+(colors not shown here, but `✓`/`✗` status markers, cyan table borders,
+and a bordered startup banner all render in a real terminal; see the
+Interface Layer section above for the `MINIDB_ASCII=1` fallback if your
+terminal can't display Unicode.)
+
+## Distributing MiniDB
+
+Because MiniDB has zero external runtime dependencies (JUnit is
+test-only), it packages as an ordinary runnable JAR — no "fat jar" /
+shading step needed, and no dependency-missing errors on someone else's
+machine.
+
+**Plain JAR (needs Java 17+ installed on the user's machine):**
+
+```bash
+# with Maven
+mvn package
+# -> target/minidb-0.1.0-SNAPSHOT.jar
+
+# or without Maven
+mkdir out
+javac -d out $(find src/main/java -name "*.java")
+jar cfe MiniDB.jar com.minidb.cli.MiniDBShell -C out .
+```
+
+Hand someone `MiniDB.jar` and they run it with `java -jar MiniDB.jar` —
+nothing else to install beyond a JRE.
+
+**Native installer, no Java required at all (`jpackage`, bundled with
+JDK 14+):**
+
+`jpackage` bundles the JAR together with a trimmed Java runtime into a
+real installer for whatever OS it's run on — a `.exe`/`.msi` on Windows,
+a `.dmg`/`.pkg` on macOS, a `.deb`/`.rpm` on Linux. It only builds for
+the OS it's running on, so a Windows installer has to be built on
+Windows:
+
+```powershell
+jpackage --type exe `
+  --name MiniDB `
+  --input . `
+  --main-jar MiniDB.jar `
+  --main-class com.minidb.cli.MiniDBShell `
+  --win-console `
+  --dest dist
+```
+
+(`--type msi` works the same way for an MSI instead of an EXE.
+`--win-console` keeps the terminal window open, since MiniDB is a
+CLI — without it Windows treats it as a windowed app with nowhere to
+show output. Building the `.exe`/`.msi` variants specifically requires
+the [WiX Toolset](https://wixtoolset.org/) installed; `--type app-image`
+skips that requirement and just produces a folder with `MiniDB.exe` and
+a bundled runtime inside, which is enough for "download, unzip, double-click."
+
+**Publishing it for others to actually download:**
+
+Tag a release on GitHub and attach the built JAR (and installer, if you
+built one) as release assets — anyone can then grab it from the
+repo's Releases page without cloning or building anything:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+# then, on GitHub: Releases -> Draft a new release -> pick the tag -> attach MiniDB.jar
 ```
 
 ## Design decisions worth calling out (interview talking points)

@@ -14,25 +14,28 @@ import java.util.Set;
  * A simple REPL for MiniDB. Reads SQL statements terminated by ';', runs
  * them through MiniDBConnection, and prints the result as a formatted
  * table (for SELECT) or a one-line status message (for everything else).
- * This is intentionally thin — all it does is read a line, forward it to
- * MiniDBConnection, and print what comes back. If a TCP server mode is
- * added later, it would be a second, equally thin front end calling the
- * exact same MiniDBConnection.execute(sql) method.
  */
 public class MiniDBShell {
+
+    // ANSI escape codes for styling
+    private static final String RESET   = "\u001B[0m";
+    private static final String CYAN    = "\u001B[36m";
+    private static final String YELLOW  = "\u001B[33m";
+    private static final String GRAY    = "\u001B[90m";
+    private static final String BOLD    = "\u001B[1m";
+    private static final String GREEN   = "\u001B[32m";
+    private static final String RED     = "\u001B[31m";
 
     public static void main(String[] args) throws IOException {
         String dataDir = args.length > 0 ? args[0] : "minidb_data";
 
-        System.out.println("MiniDB — a relational database built from scratch in Java");
-        System.out.println("Data directory: " + dataDir);
-        System.out.println("Type SQL statements ending in ';'. Type 'help' for commands, 'exit' to quit.\n");
+        printBanner(dataDir);
 
         try (MiniDBConnection connection = new MiniDBConnection(dataDir)) {
             BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
             StringBuilder buffer = new StringBuilder();
 
-            System.out.print("minidb> ");
+            prompt(buffer);
             String line;
             while ((line = reader.readLine()) != null) {
                 String trimmed = line.trim();
@@ -64,18 +67,41 @@ public class MiniDBShell {
                     String sql = buffer.toString().trim();
                     buffer.setLength(0);
                     runStatement(connection, sql);
-                    System.out.print("minidb> ");
+                    prompt(buffer);
                 } else {
-                    System.out.print("     -> ");
+                    prompt(buffer);
                 }
             }
         }
 
-        System.out.println("Goodbye.");
+        System.out.println(GRAY + "Goodbye." + RESET);
+    }
+
+    private static void printBanner(String dataDir) {
+        String art = 
+            "   __  ____       _ ____  ____  \n" +
+            "  /  |/  (_)___  (_) __ \\/ __ ) \n" +
+            " / /|_/ / / __ \\/ / / / / __  | \n" +
+            "/ /  / / / / / / / /_/ / /_/ /  \n" +
+            "/_/  /_/_/_/ /_/_/_____/_____/   ";
+
+        String divider = " ═══════════════════════════════";
+
+        System.out.println(CYAN + art + RESET);
+        System.out.println(YELLOW + divider + RESET);
+        System.out.println(BOLD + YELLOW + "  :: RELATIONAL ENGINE v1.0 ::  " + RESET);
+        System.out.println(YELLOW + divider + RESET);
+        System.out.println(GRAY + "Data Directory : " + RESET + BOLD + dataDir + RESET);
+        System.out.println(GRAY + "Commands       : " + GREEN + "help" + GRAY + ", " + GREEN + "tables" + GRAY + ", " + GREEN + "exit" + RESET);
+        System.out.println(GRAY + "Query Syntax   : Terminate SQL statements with ';'\n" + RESET);
     }
 
     private static void prompt(StringBuilder buffer) {
-        System.out.print(buffer.length() == 0 ? "minidb> " : "     -> ");
+        if (buffer.length() == 0) {
+            System.out.print(CYAN + "minidb> " + RESET);
+        } else {
+            System.out.print(GRAY + "     -> " + RESET);
+        }
     }
 
     private static void runStatement(MiniDBConnection connection, String sql) {
@@ -85,12 +111,12 @@ public class MiniDBShell {
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
             if (result.isQuery()) {
                 printResultSet(result.getResultSet());
-                System.out.println("(" + result.getResultSet().size() + " row(s) in " + elapsedMs + " ms)");
+                System.out.println(GRAY + "(" + result.getResultSet().size() + " row(s) in " + elapsedMs + " ms)" + RESET);
             } else {
-                System.out.println(result.getMessage() + " (" + elapsedMs + " ms)");
+                System.out.println(result.getMessage() + GRAY + " (" + elapsedMs + " ms)" + RESET);
             }
         } catch (Exception e) {
-            System.out.println("Error: " + e.getMessage());
+            System.out.println(RED + "Error: " + e.getMessage() + RESET);
         }
     }
 
@@ -99,7 +125,9 @@ public class MiniDBShell {
         List<Object[]> rows = rs.getRows();
 
         int[] widths = new int[columns.size()];
-        for (int i = 0; i < columns.size(); i++) widths[i] = columns.get(i).length();
+        for (int i = 0; i < columns.size(); i++) {
+            widths[i] = columns.get(i).length();
+        }
         for (Object[] row : rows) {
             for (int i = 0; i < row.length; i++) {
                 String s = row[i] == null ? "NULL" : row[i].toString();
@@ -133,29 +161,31 @@ public class MiniDBShell {
 
     private static String pad(String s, int width) {
         StringBuilder sb = new StringBuilder(s);
-        while (sb.length() < width) sb.append(' ');
+        while (sb.length() < width) {
+            sb.append(' ');
+        }
         return sb.toString();
     }
 
     private static void printTables(MiniDBConnection connection) {
         Set<String> tables = connection.listTables();
         if (tables.isEmpty()) {
-            System.out.println("(no tables)");
+            System.out.println(GRAY + "(no tables)" + RESET);
         } else {
             tables.forEach(System.out::println);
         }
     }
 
     private static void printHelp() {
-        System.out.println("MiniDB supported statements:");
-        System.out.println("  CREATE TABLE name (col TYPE [PRIMARY KEY|NOT NULL], ...)");
-        System.out.println("  DROP TABLE name");
-        System.out.println("  CREATE INDEX name ON table (column)");
-        System.out.println("  INSERT INTO table [(cols)] VALUES (...)");
-        System.out.println("  SELECT cols|* FROM table [JOIN t2 ON ...] [WHERE ...] [ORDER BY ... ASC|DESC]");
-        System.out.println("  UPDATE table SET col = val, ... [WHERE ...]");
-        System.out.println("  DELETE FROM table [WHERE ...]");
-        System.out.println("  BEGIN | COMMIT | ROLLBACK");
-        System.out.println("Shell commands: tables, help, exit / quit");
+        System.out.println(BOLD + "MiniDB supported statements:" + RESET);
+        System.out.println("  " + GREEN + "CREATE TABLE" + RESET + " name (col TYPE [PRIMARY KEY|NOT NULL], ...)");
+        System.out.println("  " + GREEN + "DROP TABLE" + RESET + " name");
+        System.out.println("  " + GREEN + "CREATE INDEX" + RESET + " name ON table (column)");
+        System.out.println("  " + GREEN + "INSERT INTO" + RESET + " table [(cols)] VALUES (...)");
+        System.out.println("  " + GREEN + "SELECT" + RESET + " cols|* FROM table [JOIN t2 ON ...] [WHERE ...] [ORDER BY ... ASC|DESC]");
+        System.out.println("  " + GREEN + "UPDATE" + RESET + " table SET col = val, ... [WHERE ...]");
+        System.out.println("  " + GREEN + "DELETE FROM" + RESET + " table [WHERE ...]");
+        System.out.println("  " + GREEN + "BEGIN" + RESET + " | " + GREEN + "COMMIT" + RESET + " | " + GREEN + "ROLLBACK" + RESET);
+        System.out.println(BOLD + "Shell commands:" + RESET + " tables, help, exit / quit");
     }
 }
