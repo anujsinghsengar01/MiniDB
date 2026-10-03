@@ -1,7 +1,18 @@
 target/
 out/
 *.class
+
+# Database data & logs
+minidb_data/
 *.tbl
+*.sys
+*.log
+
+# IDE files
 .idea/
 *.iml
 .vscode/
+
+
+# Build / scratch files
+sources.txt
